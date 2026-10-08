@@ -1,4 +1,4 @@
-"""Orders — наивная реализация.
+"""Orders — не такаю уж и наивная реализация.
 
 Оформление заказа: зарезервировать товар в Inventory, списать деньги в
 Payment, записать заказ в базу. Пока Payment и Inventory работают без отказов, всё работает.
@@ -8,8 +8,10 @@ import json
 import logging
 import os
 import re
+import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -20,6 +22,9 @@ PORT = int(os.environ.get("PORT", "8080"))
 DATABASE_URL = os.environ["DATABASE_URL"]
 PAYMENT_URL = os.environ["PAYMENT_URL"].rstrip("/")
 INVENTORY_URL = os.environ["INVENTORY_URL"].rstrip("/")
+
+PAYMENT_TIMEOUT = 6
+LOOKUP_TIMEOUT = 0.8
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("orders")
@@ -34,6 +39,13 @@ CREATE TABLE IF NOT EXISTS orders (
     created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
 )
 """
+
+
+pay_sem = threading.Semaphore(5)
+pay_lock = threading.Lock()
+pay_down = False
+pay_at = 0.0
+probing = False
 
 
 def db():
@@ -53,13 +65,15 @@ def init_db():
     raise SystemExit("не дождался базы")
 
 
-def call(method, url, body=None):
+def call(method, url, body=None, key="", timeout=2):
     """HTTP-вызов Payment или Inventory. Возвращает (код, тело)."""
     data = json.dumps(body).encode() if body is not None else None
     req = urllib.request.Request(url, data=data, method=method)
     req.add_header("Content-Type", "application/json")
+    if key:
+        req.add_header("Idempotency-Key", key)
     try:
-        with urllib.request.urlopen(req) as resp:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
             return resp.status, json.loads(resp.read() or b"null")
     except urllib.error.HTTPError as e:
         return e.code, None
@@ -79,31 +93,99 @@ def reserve(order_id, items):
 
 
 def release(order_id):
-    call("DELETE", f"{INVENTORY_URL}/reservations/{order_id}")
+    try:
+        call("DELETE", f"{INVENTORY_URL}/reservations/{order_id}")
+    except OSError:
+        pass
+
+
+def set_status(order_id, status):
+    with db() as conn:
+        conn.execute("UPDATE orders SET status = %s WHERE id = %s", (status, order_id))
+
+
+def wait_payment():
+    global probing
+    while True:
+        with pay_lock:
+            wait = pay_at - time.monotonic()
+            if not pay_down or (wait <= 0 and not probing):
+                if pay_down:
+                    probing = True
+                return
+        time.sleep(max(0.1, wait))
+
+
+def payment_result(timeout):
+    global pay_down, pay_at, probing
+    with pay_lock:
+        probing = False
+        pay_down = timeout
+        if timeout:
+            pay_at = time.monotonic() + 2
+
+
+def lookup_paid(order_id):
+    url = f"{PAYMENT_URL}/payments?order_id={urllib.parse.quote(order_id)}"
+    try:
+        code, body = call("GET", url, timeout=LOOKUP_TIMEOUT)
+    except OSError:
+        return False, False
+    if code != 200:
+        return False, True
+    try:
+        return len(json.loads(body or b"[]")) > 0, True
+    except ValueError:
+        return False, True
 
 
 def charge_once(order_id, amount):
-    try:
-        code, _ = call("POST", f"{PAYMENT_URL}/payments", {
-            "order_id": order_id,
-            "amount_cents": amount,
-            "currency": "RUB",
-        })
-    except OSError as e:
-        raise PaymentError(str(e))
-    if code in (200, 201):
-        return "paid"
-    if code == 402:
-        return "declined"
-    raise PaymentError(f"payment: {code}")
+    with pay_sem:
+        wait_payment()
+        started = time.monotonic()
+        try:
+            code, _ = call("POST", f"{PAYMENT_URL}/payments", {
+                "order_id": order_id,
+                "amount_cents": amount,
+                "currency": "RUB",
+            }, key=order_id, timeout=PAYMENT_TIMEOUT)
+        except OSError:
+            if time.monotonic() - started > PAYMENT_TIMEOUT - 0.5:
+                paid, ok = lookup_paid(order_id)
+                if paid:
+                    payment_result(False)
+                    return "paid"
+                if not ok:
+                    payment_result(True)
+                    return None
+            payment_result(False)
+            return None
+        payment_result(False)
+        if code in (200, 201):
+            return "paid"
+        if code == 402:
+            return "rejected"
+        return None
 
 
-def charge(order_id, amount):
-    try:
-        return charge_once(order_id, amount)
-    except PaymentError as e:
-        log.warning("order %s: оплата не прошла (%s), пробую ещё раз", order_id, e)
-        return charge_once(order_id, amount)
+def process(order_id, items, amount):
+    while True:
+        try:
+            reserve(order_id, items)
+            break
+        except Exception as e:
+            log.warning("order %s: бронирование завершилось с ошибкой: %s", order_id, e)
+            time.sleep(1)
+    while True:
+        status = charge_once(order_id, amount)
+        if status == "paid":
+            set_status(order_id, "paid")
+            return
+        if status == "rejected":
+            release(order_id)
+            set_status(order_id, "rejected")
+            return
+        time.sleep(0.15)
 
 
 def valid(body):
@@ -114,14 +196,14 @@ def valid(body):
     items = body.get("items")
     if not isinstance(items, list) or not items:
         return False
-    for i in items:
-        if not isinstance(i, dict):
+    for item in items:
+        if not isinstance(item, dict):
             return False
-        if not isinstance(i.get("sku"), str) or not i["sku"]:
+        if not isinstance(item.get("sku"), str) or not item["sku"]:
             return False
-        for k, minimum in (("qty", 1), ("price_cents", 0)):
-            v = i.get(k)
-            if not isinstance(v, int) or isinstance(v, bool) or v < minimum:
+        for key, minimum in (("qty", 1), ("price_cents", 0)):
+            value = item.get(key)
+            if not isinstance(value, int) or isinstance(value, bool) or value < minimum:
                 return False
     return True
 
@@ -129,22 +211,13 @@ def valid(body):
 def create_order(body):
     order_id = str(uuid.uuid4())
     amount = sum(i["qty"] * i["price_cents"] for i in body["items"])
-
-    reserve(order_id, body["items"])
-    result = charge(order_id, amount)
-    if result == "declined":
-        release(order_id)
-        status = "rejected"
-    else:
-        status = "paid"
-
     with db() as conn:
         conn.execute(
             "INSERT INTO orders (id, user_id, status, amount_cents, items) VALUES (%s, %s, %s, %s, %s)",
-            (order_id, body["user_id"], status, amount, json.dumps(body["items"])),
+            (order_id, body["user_id"], "pending", amount, json.dumps(body["items"])),
         )
-    log.info("order %s: %s", order_id, status)
-    return {"id": order_id, "status": status}
+    threading.Thread(target=process, args=(order_id, body["items"], amount), daemon=True).start()
+    return {"id": order_id, "status": "pending"}
 
 
 def get_order(order_id):
