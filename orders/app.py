@@ -1,9 +1,3 @@
-"""Orders — не такаю уж и наивная реализация.
-
-Оформление заказа: зарезервировать товар в Inventory, списать деньги в
-Payment, записать заказ в базу. Пока Payment и Inventory работают без отказов, всё работает.
-"""
-
 import json
 import logging
 import os
@@ -22,6 +16,7 @@ PORT = int(os.environ.get("PORT", "8080"))
 DATABASE_URL = os.environ["DATABASE_URL"]
 PAYMENT_URL = os.environ["PAYMENT_URL"].rstrip("/")
 INVENTORY_URL = os.environ["INVENTORY_URL"].rstrip("/")
+EVENTS_URL = os.environ["EVENTS_URL"].rstrip("/")
 
 PAYMENT_TIMEOUT = 6
 LOOKUP_TIMEOUT = 0.8
@@ -37,7 +32,18 @@ CREATE TABLE IF NOT EXISTS orders (
     amount_cents BIGINT NOT NULL,
     items        JSONB NOT NULL,
     created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
-)
+);
+CREATE TABLE IF NOT EXISTS outbox (
+    id TEXT PRIMARY KEY,
+    order_id TEXT NOT NULL UNIQUE REFERENCES orders(id),
+    sent BOOLEAN NOT NULL DEFAULT false
+);
+CREATE TABLE IF NOT EXISTS deliveries (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    points BIGINT NOT NULL CHECK (points > 0)
+);
+CREATE INDEX IF NOT EXISTS deliveries_user ON deliveries(user_id)
 """
 
 
@@ -53,7 +59,6 @@ def db():
 
 
 def init_db():
-    # База может подниматься дольше сервиса — ждём её.
     for attempt in range(60):
         try:
             with db() as conn:
@@ -66,7 +71,6 @@ def init_db():
 
 
 def call(method, url, body=None, key="", timeout=2):
-    """HTTP-вызов Payment или Inventory. Возвращает (код, тело)."""
     data = json.dumps(body).encode() if body is not None else None
     req = urllib.request.Request(url, data=data, method=method)
     req.add_header("Content-Type", "application/json")
@@ -93,15 +97,20 @@ def reserve(order_id, items):
 
 
 def release(order_id):
-    try:
-        call("DELETE", f"{INVENTORY_URL}/reservations/{order_id}")
-    except OSError:
-        pass
+    code, _ = call("DELETE", f"{INVENTORY_URL}/reservations/{order_id}")
+    if code != 204:
+        raise RuntimeError(f"inventory: {code}")
 
 
 def set_status(order_id, status):
     with db() as conn:
-        conn.execute("UPDATE orders SET status = %s WHERE id = %s", (status, order_id))
+        with conn.transaction():
+            conn.execute("UPDATE orders SET status = %s WHERE id = %s", (status, order_id))
+            if status == "paid":
+                conn.execute(
+                    "INSERT INTO outbox (id, order_id) VALUES (%s, %s) ON CONFLICT DO NOTHING",
+                    (f"order.paid:{order_id}", order_id),
+                )
 
 
 def wait_payment():
@@ -133,10 +142,7 @@ def lookup_paid(order_id):
         return False, False
     if code != 200:
         return False, True
-    try:
-        return len(json.loads(body or b"[]")) > 0, True
-    except ValueError:
-        return False, True
+    return bool(body), True
 
 
 def charge_once(order_id, amount):
@@ -188,6 +194,71 @@ def process(order_id, items, amount):
         time.sleep(0.15)
 
 
+def run_order(order_id, items, amount):
+    while True:
+        try:
+            process(order_id, items, amount)
+            return
+        except Exception:
+            log.exception("order %s", order_id)
+            time.sleep(1)
+
+
+def start_order(order_id, items, amount):
+    threading.Thread(target=run_order, args=(order_id, items, amount), daemon=True).start()
+
+
+def recover_orders():
+    with db() as conn:
+        rows = conn.execute(
+            "SELECT id, items, amount_cents FROM orders WHERE status = 'pending'"
+        ).fetchall()
+    for row in rows:
+        start_order(*row)
+
+
+def publish_events():
+    while True:
+        try:
+            with db() as conn:
+                rows = conn.execute("SELECT id, order_id FROM outbox WHERE NOT sent LIMIT 100").fetchall()
+            for event_id, order_id in rows:
+                code, _ = call("POST", f"{EVENTS_URL}/events", {
+                    "id": event_id, "type": "order.paid", "order_id": order_id,
+                }, timeout=2)
+                if code != 202:
+                    break
+                with db() as conn:
+                    conn.execute("UPDATE outbox SET sent = true WHERE id = %s", (event_id,))
+        except Exception as e:
+            log.warning("события: %s", e)
+        time.sleep(0.5)
+
+
+def accept_delivery(body):
+    if not isinstance(body, dict) or body.get("type") != "delivery.confirmed":
+        return False
+    if any(not isinstance(body.get(key), str) or not body[key] for key in ("id", "user_id")):
+        return False
+    points = body.get("bonus_points")
+    if type(points) is not int or not 1 <= points <= 2**63 - 1:
+        return False
+    with db() as conn:
+        conn.execute(
+            "INSERT INTO deliveries (id, user_id, points) VALUES (%s, %s, %s) ON CONFLICT DO NOTHING",
+            (body["id"], body["user_id"], points),
+        )
+    return True
+
+
+def get_bonus(user_id):
+    with db() as conn:
+        row = conn.execute(
+            "SELECT COALESCE(SUM(points), 0) FROM deliveries WHERE user_id = %s", (user_id,)
+        ).fetchone()
+    return {"points": int(row[0])}
+
+
 def valid(body):
     if not isinstance(body, dict):
         return False
@@ -216,7 +287,7 @@ def create_order(body):
             "INSERT INTO orders (id, user_id, status, amount_cents, items) VALUES (%s, %s, %s, %s, %s)",
             (order_id, body["user_id"], "pending", amount, json.dumps(body["items"])),
         )
-    threading.Thread(target=process, args=(order_id, body["items"], amount), daemon=True).start()
+    start_order(order_id, body["items"], amount)
     return {"id": order_id, "status": "pending"}
 
 
@@ -231,6 +302,7 @@ def get_order(order_id):
 
 
 ORDER_PATH = re.compile(r"^/orders/([^/]+)$")
+BONUS_PATH = re.compile(r"^/users/([^/]+)/bonus$")
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -247,6 +319,9 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/healthz":
             return self.send_json(200, {"status": "ok"})
+        m = BONUS_PATH.match(self.path)
+        if m:
+            return self.send_json(200, get_bonus(urllib.parse.unquote(m.group(1))))
         m = ORDER_PATH.match(self.path)
         if m:
             order = get_order(m.group(1))
@@ -256,13 +331,21 @@ class Handler(BaseHTTPRequestHandler):
         self.send_json(404, {"error": "not_found"})
 
     def do_POST(self):
-        if self.path != "/orders":
+        if self.path not in ("/orders", "/webhooks/delivery"):
             return self.send_json(404, {"error": "not_found"})
         length = int(self.headers.get("Content-Length") or 0)
         try:
             body = json.loads(self.rfile.read(length) or b"null")
         except ValueError:
             body = None
+        if self.path == "/webhooks/delivery":
+            try:
+                if not accept_delivery(body):
+                    return self.send_json(400, {"error": "bad_request"})
+                return self.send_json(200, {"status": "ok"})
+            except psycopg.Error:
+                log.exception("POST /webhooks/delivery")
+                return self.send_json(503, {"error": "unavailable"})
         if not valid(body):
             return self.send_json(400, {"error": "bad_request"})
         try:
@@ -277,6 +360,8 @@ class Handler(BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     init_db()
+    recover_orders()
+    threading.Thread(target=publish_events, daemon=True).start()
     server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
     server.daemon_threads = True
     log.info("orders: слушаю :%d", PORT)
